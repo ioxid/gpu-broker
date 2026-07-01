@@ -1,0 +1,25 @@
+{
+  "gpu_index": 0,
+  "socket_path": "/run/gpu-broker/sock",
+  "state_dir": "/var/lib/gpu-broker",
+  "log_dir": "/var/lib/gpu-broker/jobs",
+  "daemon_log": "/var/lib/gpu-broker/brokerd.log",
+
+  "queues": ["high", "normal", "ci"],
+  "default_time_sec": 1200,
+  "max_time_sec": 43200,
+  "kill_grace_sec": 10,
+  "watchdog_interval_sec": 3,
+  "watchdog_action": "report",
+  "watchdog_whitelist_uids": [],
+
+  "gpu_group": "gpu",
+  "gate_enabled": false,
+  "gate_devices": ["/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"],
+  "gate_mode": "0660",
+
+  "users": {
+    "github-runner": { "queues": ["ci"], "default": "ci" }
+  },
+  "default_user_policy": { "queues": ["high", "normal"], "default": "normal" }
+}

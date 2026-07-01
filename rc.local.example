@@ -1,0 +1,14 @@
+#!/bin/bash
+# Invoked by the container entrypoint (/.launch) on every boot, as root.
+# Autostart the gpu-broker root supervisord (GPU queue daemon + uvm gate upkeep).
+
+# gpu group is needed for the uvm gate; harmless if it already exists.
+groupadd -f gpu
+
+# /run is volatile — recreate the runtime dir before supervisord needs it.
+mkdir -p /run/gpu-broker
+
+# Start only if not already running (idempotent across re-invocations).
+if ! pgrep -f 'supervisord -c /etc/gpu-broker/supervisord.conf' >/dev/null 2>&1; then
+  /usr/local/bin/supervisord -c /etc/gpu-broker/supervisord.conf
+fi
