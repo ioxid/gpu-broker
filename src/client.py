@@ -86,15 +86,30 @@ def cmd_submit(argv):
         sys.exit(follow_job(r["id"], r["log"]))   # exit with the job's own status
 
 
+def fmt_clock(ts):
+    return time.strftime("%H:%M", time.localtime(ts)) if ts else "--:--"
+
+
 def cmd_q(argv):
-    r = call({"op": "list"})
+    p = argparse.ArgumentParser(
+        prog="gpu-q",
+        description="Show the GPU queue: what is running and what is waiting. "
+                    "With -a, also show recently finished jobs (history).")
+    p.add_argument("-a", "--all", action="store_true", help="also show recently finished jobs")
+    p.add_argument("-n", "--limit", type=int, default=15, metavar="N",
+                   help="how many finished jobs to show with -a (default 15)")
+    a = p.parse_args(argv)
+    req = {"op": "list"}
+    if a.all:
+        req["history"] = a.limit
+    r = call(req)
     run = r.get("running")
     print("=== running ===")
     if run:
-        print("  #%-4d %-12s %-7s %-8s %s  %s"
+        print("  #%-4d %-12s %-7s %-11s %s"
               % (run["id"], run["user"], run["queue"],
                  fmt_dur(run.get("elapsed", 0)) + "/" + fmt_dur(run["time_sec"]),
-                 run.get("name", ""), ""))
+                 run.get("name", "")))
     else:
         print("  (GPU idle)")
     pend = r.get("pending", [])
@@ -102,6 +117,16 @@ def cmd_q(argv):
     for j in pend:
         print("  #%-4d %-12s %-7s limit=%-6s %s"
               % (j["id"], j["user"], j["queue"], fmt_dur(j["time_sec"]), j.get("name", "")))
+    if a.all:
+        fin = r.get("finished", [])
+        print("=== recent (%d) ===" % len(fin))
+        for j in fin:
+            st, st_e = j.get("start_ts"), j.get("end_ts")
+            dur = fmt_dur(st_e - st) if st and st_e else "-"
+            ec = j.get("exit_code")
+            print("  #%-4d %-12s %-7s %-9s exit=%-4s %-7s ended %s  %s"
+                  % (j["id"], j.get("user", ""), j.get("queue", ""), j.get("state", ""),
+                     "-" if ec is None else ec, dur, fmt_clock(st_e), j.get("name", "")))
 
 
 def cmd_log(argv):

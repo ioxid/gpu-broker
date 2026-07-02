@@ -172,13 +172,17 @@ class Broker:
         return {"ok": True, "id": jid, "queue": queue, "time_sec": capped,
                 "log": job["log"], "warn": warn}
 
-    def list_jobs(self):
+    def list_jobs(self, history=0):
         with self.lock:
             run = dict(self.running) if self.running else None
             if run:
                 run["elapsed"] = time.time() - (run.get("start_ts") or time.time())
             pend = sorted(self.pending, key=lambda j: (self.queue_rank(j["queue"]), j["submit_ts"]))
-            return {"ok": True, "running": run, "pending": [scrub(j) for j in pend]}
+            resp = {"ok": True, "running": run, "pending": [scrub(j) for j in pend]}
+            if history:
+                recent = list(self.finished.values())[-history:]
+                resp["finished"] = list(reversed(recent))   # newest first
+            return resp
 
     def cancel(self, uid, jid):
         with self.lock:
@@ -512,7 +516,7 @@ class Broker:
             if op == "submit":
                 resp = self.submit(uid, gid, req)
             elif op in ("list", "status"):
-                resp = self.list_jobs()
+                resp = self.list_jobs(int(req.get("history", 0)))
             elif op == "cancel":
                 resp = self.cancel(uid, int(req["id"]))
             elif op == "log":

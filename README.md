@@ -58,6 +58,7 @@ gpu-submit -q high -t 4h -n bigrun -- ./run.sh # priority queue, 4h limit, a nam
 gpu-submit -- bash -c 'cd ~/p && ./run.sh'     # shell constructs: wrap in bash -c
 
 gpu-q                 # what's running and what's queued
+gpu-q -a              # + recently finished jobs (history)
 gpu-log 42            # a job's output   (gpu-log 42 -f  to follow)
 gpu-cancel 42         # drop from queue / stop if running
 ```
