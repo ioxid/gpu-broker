@@ -132,21 +132,26 @@ class Broker:
         except ValueError:
             return len(self.cfg["queues"])
 
-    # ---------- submit ----------
-    def submit(self, uid, gid, req):
+    # ---------- submit / lease ----------
+    def _resolve_queue(self, uid, req):
+        """Pick + authorize the queue for this user. -> (queue, None) or (None, error)."""
         pol = self.user_policy(uid)
         queue = req.get("queue") or pol.get("default", self.cfg["queues"][-1])
         if queue not in self.cfg["queues"]:
-            return {"ok": False, "error": "unknown queue %r" % queue}
+            return None, "unknown queue %r" % queue
         if queue not in pol["queues"]:
-            return {"ok": False, "error": "user %s not allowed in queue %r (allowed: %s)"
-                    % (uid_name(uid), queue, ",".join(pol["queues"]))}
-        cmd = req.get("cmd")
-        if not cmd or not isinstance(cmd, list):
-            return {"ok": False, "error": "empty command"}
+            return None, ("user %s not allowed in queue %r (allowed: %s)"
+                          % (uid_name(uid), queue, ",".join(pol["queues"])))
+        return queue, None
+
+    def _capped_time(self, req):
         t = req.get("time")
         time_sec = self.cfg["default_time_sec"] if not t else int(t)
         capped = min(time_sec, self.cfg["max_time_sec"])
+        warn = " (time capped to %ds ceiling)" % capped if capped < time_sec else ""
+        return capped, warn
+
+    def _enqueue(self, uid, gid, queue, capped, extra):
         with self.lock:
             self.counter += 1
             jid = self.counter
@@ -154,23 +159,71 @@ class Broker:
                 "id": jid,
                 "uid": uid, "gid": gid, "user": uid_name(uid),
                 "queue": queue,
-                "cmd": cmd,
-                "cwd": req.get("cwd") or pwd.getpwuid(uid).pw_dir,
-                "env": req.get("env") or {},
-                "name": req.get("name") or "",
+                "description": extra.get("description") or "",
                 "time_sec": capped,
                 "state": "pending",
                 "submit_ts": time.time(),
                 "log": os.path.join(self.cfg["log_dir"], "%d.log" % jid),
                 "pgid": None, "start_ts": None, "end_ts": None, "exit_code": None,
             }
+            job.update(extra)
             self.pending.append(job)
             self._persist()
-        warn = ""
-        if capped < time_sec:
-            warn = " (time capped to %ds ceiling)" % capped
+        return jid, job
+
+    def submit(self, uid, gid, req):
+        queue, err = self._resolve_queue(uid, req)
+        if err:
+            return {"ok": False, "error": err}
+        cmd = req.get("cmd")
+        if not cmd or not isinstance(cmd, list):
+            return {"ok": False, "error": "empty command"}
+        capped, warn = self._capped_time(req)
+        jid, job = self._enqueue(uid, gid, queue, capped, {
+            "kind": "job", "cmd": cmd,
+            "cwd": req.get("cwd") or pwd.getpwuid(uid).pw_dir,
+            "env": req.get("env") or {},
+            "description": req.get("description") or "",
+        })
         return {"ok": True, "id": jid, "queue": queue, "time_sec": capped,
                 "log": job["log"], "warn": warn}
+
+    def lease(self, uid, gid, req):
+        """Reserve the GPU slot with NO process of our own — the caller runs the
+        real GPU work in its own process and just wants a turn on the shared GPU.
+        The slot is a first-class job record (shows its name + real exit in
+        history, no placeholder process); released via the `release` op, and
+        self-heals via the time limit if the caller dies without releasing."""
+        queue, err = self._resolve_queue(uid, req)
+        if err:
+            return {"ok": False, "error": err}
+        capped, warn = self._capped_time(req)
+        jid, job = self._enqueue(uid, gid, queue, capped, {
+            "kind": "lease", "cmd": None, "cwd": "/", "env": {},
+            "description": req.get("description") or "",
+            "released": False, "release_exit": None,
+        })
+        return {"ok": True, "id": jid, "queue": queue, "time_sec": capped,
+                "log": job["log"], "warn": warn}
+
+    def release(self, uid, jid, exit_code):
+        with self.lock:
+            if self.running and self.running["id"] == jid:
+                if uid not in (0, self.running["uid"]):
+                    return {"ok": False, "error": "not your job"}
+                if self.running.get("kind") != "lease":
+                    return {"ok": False, "error": "job #%d is not a lease" % jid}
+                self.running["released"] = True
+                self.running["release_exit"] = int(exit_code)
+                return {"ok": True, "msg": "released lease #%d" % jid}
+            for j in self.pending:
+                if j["id"] == jid:
+                    if uid not in (0, j["uid"]):
+                        return {"ok": False, "error": "not your job"}
+                    self.pending.remove(j)
+                    self._persist()
+                    return {"ok": True, "msg": "released pending lease #%d" % jid}
+        return {"ok": False, "error": "no such job #%d" % jid}
 
     def list_jobs(self, history=0):
         with self.lock:
@@ -249,13 +302,23 @@ class Broker:
             job["state"] = "running"
             job["start_ts"] = time.time()
             self.running = job
-        # pre-create log owned by the submitting user
+        # pre-create log owned by the submitting user (a lease caller tees its
+        # own process output into this same file, so gpu-log still works)
         try:
             fd = os.open(job["log"], os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
             os.close(fd)
             os.chown(job["log"], job["uid"], job["gid"])
         except Exception as e:
             self.log("log setup failed for #%s: %s" % (job["id"], e))
+        if job.get("kind") == "lease":
+            # A lease has no process of its own: it just holds the slot.
+            with self.lock:
+                job["pgid"] = None
+                self._persist()
+            self.log("leased #%s user=%s queue=%s limit=%ss desc=%s"
+                     % (job["id"], job["user"], job["queue"], job["time_sec"],
+                        job.get("description") or "-"))
+            return
         pid = os.fork()
         if pid == 0:
             self._child_exec(job)        # never returns
@@ -310,6 +373,9 @@ class Broker:
             os._exit(127)
 
     def _monitor(self, job):
+        if job.get("kind") == "lease":
+            self._monitor_lease(job)
+            return
         pgid = job["pgid"]
         deadline = job["start_ts"] + job["time_sec"]
         termed_at = None
@@ -363,6 +429,39 @@ class Broker:
                 self.finished.popitem(last=False)
             self._persist()
         self.log("finished #%s state=%s exit=%s" % (job["id"], job["state"], job["exit_code"]))
+
+    def _monitor_lease(self, job):
+        """Hold the slot for a process-less lease until the caller releases it
+        (release op) or the time limit / a cancel frees it."""
+        deadline = job["start_ts"] + job["time_sec"]
+        while True:
+            with self.lock:
+                released = job.get("released")
+                rexit = job.get("release_exit")
+                cancelled = self.cancel_running.is_set()
+            if released:
+                code = rexit if rexit is not None else 0
+                self._finish_lease(job, "done" if code == 0 else "failed", code)
+                return
+            if cancelled:
+                self._finish_lease(job, "cancelled", None)
+                return
+            if time.time() > deadline:
+                self._finish_lease(job, "timeout", None)
+                return
+            time.sleep(0.2)
+
+    def _finish_lease(self, job, state, exit_code):
+        with self.lock:
+            job["end_ts"] = time.time()
+            job["state"] = state
+            job["exit_code"] = exit_code
+            self.running = None
+            self.finished[job["id"]] = job_record(job)
+            while len(self.finished) > FINISHED_KEEP:
+                self.finished.popitem(last=False)
+            self._persist()
+        self.log("released #%s state=%s exit=%s" % (job["id"], state, exit_code))
 
     # ---------- uvm device gate (primary soft enforcement) ----------
     def gpu_gid(self):
@@ -525,6 +624,10 @@ class Broker:
             op = req.get("op")
             if op == "submit":
                 resp = self.submit(uid, gid, req)
+            elif op == "lease":
+                resp = self.lease(uid, gid, req)
+            elif op == "release":
+                resp = self.release(uid, int(req["id"]), int(req.get("exit_code", 0)))
             elif op in ("list", "status"):
                 resp = self.list_jobs(int(req.get("history", 0)))
             elif op == "cancel":
@@ -552,13 +655,13 @@ SO_PEERCRED = 17  # Linux
 
 
 def scrub(j):
-    return {k: j.get(k) for k in ("id", "user", "queue", "name", "state",
+    return {k: j.get(k) for k in ("id", "user", "queue", "description", "kind", "state",
                                   "time_sec", "submit_ts", "start_ts", "log")}
 
 
 def job_record(j):
-    return {k: j.get(k) for k in ("id", "user", "queue", "name", "state", "exit_code",
-                                  "time_sec", "submit_ts", "start_ts", "end_ts", "log")}
+    return {k: j.get(k) for k in ("id", "user", "queue", "description", "kind", "state",
+                                  "exit_code", "time_sec", "submit_ts", "start_ts", "end_ts", "log")}
 
 
 def uid_name(uid):
