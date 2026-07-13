@@ -18,7 +18,7 @@ install -m 0755 "$here/src/client.py"   /usr/local/lib/gpu-broker/client.py
 install -m 0755 "$here/src/selftest.py" /usr/local/lib/gpu-broker/selftest.py
 
 # CLIs (dispatch by basename)
-for c in gpu-submit gpu-q gpu-log gpu-cancel; do
+for c in gpu-submit gpu-q gpu-log gpu-cancel gpu-lease; do
   ln -sf /usr/local/lib/gpu-broker/client.py /usr/local/bin/"$c"
 done
 ln -sf /usr/local/lib/gpu-broker/selftest.py /usr/local/bin/gpu-broker-test
@@ -30,7 +30,7 @@ install -m 0644 "$here/README.md"        /usr/local/share/doc/gpu-broker/README.
 
 # shell completion (fish needs a per-command filename -> symlink each)
 install -m 0644 "$here/completions/gpu-broker.fish" /usr/local/share/fish/vendor_completions.d/gpu-broker.fish
-for c in gpu-submit gpu-q gpu-log gpu-cancel; do
+for c in gpu-submit gpu-q gpu-log gpu-cancel gpu-lease; do
   ln -sf gpu-broker.fish /usr/local/share/fish/vendor_completions.d/"$c".fish
 done
 install -m 0644 "$here/completions/gpu-broker.bash" /etc/bash_completion.d/gpu-broker
