@@ -281,9 +281,14 @@ class Broker:
                 os.setgid(job["gid"])
                 os.setuid(job["uid"])
             cwd = job["cwd"]
-            if not os.path.isdir(cwd):
-                cwd = pw.pw_dir
-            os.chdir(cwd)
+            try:
+                # Fall back to the user's home if the requested cwd is missing OR
+                # unreadable by this user (e.g. submitted from another user's
+                # private dir) — otherwise chdir would fail here, before the log
+                # fds are wired up, and the job would die with an opaque exit 127.
+                os.chdir(cwd)
+            except OSError:
+                os.chdir(pw.pw_dir)
             env = dict(job.get("env") or {})
             env["USER"] = env["LOGNAME"] = pw.pw_name
             env["HOME"] = pw.pw_dir
@@ -311,16 +316,19 @@ class Broker:
         while True:
             try:
                 wpid, status = os.waitpid(pgid, os.WNOHANG)
+                # wpid==0 => our child exists and has NOT exited. That is
+                # authoritative: do NOT also probe the process *group* here, as
+                # it only comes into being once the child reaches setsid() and a
+                # pre-setsid probe would race us into a false "done".
+                if wpid != 0:
+                    self._finish(job, status)
+                    return
             except ChildProcessError:
-                wpid, status = pgid, 0    # recovered job (not our child): fall back to pgid probe
-                if pid_alive(pgid):
-                    wpid = 0
-            if wpid != 0:
-                self._finish(job, status)
-                return
-            if not pid_alive(pgid):       # recovered job ended
-                self._finish(job, 0)
-                return
+                # recovered job (not our child, re-adopted across a daemon
+                # restart): we cannot waitpid it, so fall back to a group probe.
+                if not pid_alive(pgid):
+                    self._finish(job, 0)
+                    return
             now = time.time()
             reason = None
             if self.cancel_running.is_set():
@@ -335,7 +343,9 @@ class Broker:
             if termed_at and now - termed_at > self.cfg["kill_grace_sec"]:
                 self.log("#%s grace expired -> SIGKILL pgid %s" % (job["id"], pgid))
                 killpg(pgid, signal.SIGKILL)
-            time.sleep(1)
+            # Poll finely: short jobs are reaped (and the slot freed for the next
+            # queued job / lease) promptly, not up to a second late.
+            time.sleep(0.2)
 
     def _finish(self, job, status):
         with self.lock:
