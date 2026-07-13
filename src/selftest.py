@@ -122,9 +122,9 @@ class Inst:
         s.close()
         return json.loads(data)
 
-    def submit(self, cmd, queue=None, name="", time_sec=None):
+    def submit(self, cmd, queue=None, description="", time_sec=None):
         req = {"op": "submit", "cmd": ["bash", "-c", cmd], "queue": queue,
-               "name": name, "cwd": self.dir, "env": {}}
+               "description": description, "cwd": self.dir, "env": {}}
         if time_sec: req["time"] = time_sec
         return self.call(req)
 
@@ -158,11 +158,11 @@ def test_priority_order():
     print("[int] priority ordering high>normal>ci + FIFO")
     I = Inst(); I.start()
     try:
-        I.submit("sleep 4", queue="normal", name="blocker")   # occupy slot
+        I.submit("sleep 4", queue="normal", description="blocker")   # occupy slot
         time.sleep(0.5)
-        a = I.submit("echo x", queue="ci", name="c")
-        b = I.submit("echo x", queue="high", name="h")
-        c = I.submit("echo x", queue="normal", name="n")
+        a = I.submit("echo x", queue="ci", description="c")
+        b = I.submit("echo x", queue="high", description="h")
+        c = I.submit("echo x", queue="normal", description="n")
         time.sleep(0.3)
         lst = I.call({"op": "list"})
         order = [j["queue"] for j in lst["pending"]]
@@ -200,8 +200,8 @@ def test_cancel():
     print("[int] cancel pending and running")
     I = Inst(); I.start()
     try:
-        run = I.submit("sleep 20", queue="normal", name="run")
-        pend = I.submit("sleep 20", queue="normal", name="pend")
+        run = I.submit("sleep 20", queue="normal", description="run")
+        pend = I.submit("sleep 20", queue="normal", description="pend")
         time.sleep(1)
         rc = I.call({"op": "cancel", "id": pend["id"]})
         check("cancel pending ok", rc["ok"], rc)
@@ -219,7 +219,7 @@ def test_recovery():
     print("[int] crash recovery: running job re-adopted across daemon restart")
     I = Inst(); I.start()
     try:
-        r = I.submit("sleep 8", queue="normal", name="survivor")
+        r = I.submit("sleep 8", queue="normal", description="survivor")
         time.sleep(1.5)
         pgid = json.load(open(os.path.join(I.dir, "state.json")))["running"]["pgid"]
         check("job has pgid and is alive", brokerd.pid_alive(pgid), pgid)
@@ -307,11 +307,72 @@ def test_watchdog():
         I.dump_log(); I.stop(); shutil.rmtree(I.dir, ignore_errors=True)
 
 
+def test_lease():
+    print("[int] lease: reserve slot (no process), block others, release w/ exit")
+    I = Inst(); I.start()
+    try:
+        r = I.call({"op": "lease", "queue": "normal", "description": "my-prover"})
+        check("lease queued", r["ok"], r)
+        lid = r["id"]
+        j = None
+        for _ in range(50):
+            j = I.call({"op": "get", "id": lid})["job"]
+            if j["state"] == "running":
+                break
+            time.sleep(0.1)
+        check("lease granted (running)", j["state"] == "running", j)
+        check("lease carries its description", j.get("description") == "my-prover", j)
+        check("lease has no process", j.get("kind") == "lease", j)
+        # a plain submit must queue behind the held lease (one shared slot)
+        s = I.submit("echo done", queue="normal", description="behind")
+        time.sleep(0.5)
+        lst = I.call({"op": "list"})
+        check("submit blocked behind lease",
+              lst["running"] and lst["running"]["id"] == lid
+              and any(p["id"] == s["id"] for p in lst["pending"]), lst)
+        # release with an exit code -> recorded in history; slot frees
+        rr = I.call({"op": "release", "id": lid, "exit_code": 3})
+        check("release ok", rr["ok"], rr)
+        for _ in range(50):
+            j = I.call({"op": "get", "id": lid})["job"]
+            if j["state"] in ("done", "failed", "timeout", "cancelled"):
+                break
+            time.sleep(0.1)
+        check("released lease -> failed, exit 3 in history",
+              j["state"] == "failed" and j.get("exit_code") == 3, j)
+        for _ in range(50):
+            js = I.call({"op": "get", "id": s["id"]})["job"]
+            if js["state"] == "done":
+                break
+            time.sleep(0.1)
+        check("queued job runs after release", js["state"] == "done", js)
+    finally:
+        I.dump_log(); I.stop(); shutil.rmtree(I.dir, ignore_errors=True)
+
+
+def test_lease_timeout():
+    print("[int] lease self-heals: time limit frees an unreleased slot")
+    I = Inst(); I.start()
+    try:
+        r = I.call({"op": "lease", "queue": "normal", "description": "stuck", "time": 2})
+        lid = r["id"]
+        for _ in range(50):
+            if I.call({"op": "get", "id": lid})["job"]["state"] == "running":
+                break
+            time.sleep(0.1)
+        time.sleep(4)                       # never release; the 2s cap must free it
+        j = I.call({"op": "get", "id": lid})["job"]
+        check("unreleased lease timed out", j["state"] == "timeout", j)
+    finally:
+        I.dump_log(); I.stop(); shutil.rmtree(I.dir, ignore_errors=True)
+
+
 def main():
     print("== gpu-broker self-test ==  (isolated instance, rootless, no real GPU)\n")
     unit_tests()
     for t in (test_run_and_user, test_priority_order, test_timelimit,
-              test_cancel, test_recovery, test_exitcode, test_notify, test_watchdog):
+              test_cancel, test_recovery, test_exitcode, test_lease, test_lease_timeout,
+              test_notify, test_watchdog):
         try:
             t()
         except Exception as e:

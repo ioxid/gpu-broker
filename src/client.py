@@ -60,11 +60,16 @@ def fmt_dur(sec):
 
 def cmd_submit(argv):
     p = argparse.ArgumentParser(prog="gpu-submit",
-                                usage="gpu-submit [--queue Q] [--time T] [--name N] [-w] -- CMD ...")
+                                usage="gpu-submit [--queue Q] [--time T] [--description D] [-w|-F] -- CMD ...")
     p.add_argument("--queue", "-q", default=None)
     p.add_argument("--time", "-t", default=None, help="e.g. 30m, 2h, 90s (default from config)")
-    p.add_argument("--name", "-n", default="")
+    p.add_argument("--description", "-d", default="",
+                   help="say what this run is (shown in gpu-q / history) — the more, the better")
     p.add_argument("--follow", "-w", action="store_true", help="stream output until job ends")
+    p.add_argument("--foreground", "-F", action="store_true",
+                   help="run the command here on the foreground (your stdin/tty/uid/cwd/env) "
+                        "instead of in the daemon, while holding the GPU via the lease "
+                        "protocol; output is teed to your stdout AND the broker job log")
     if "--" in argv:
         i = argv.index("--")
         opts, cmd = argv[:i], argv[i + 1:]
@@ -73,7 +78,11 @@ def cmd_submit(argv):
     a = p.parse_args(opts)
     if not cmd:
         p.error("no command given (put it after --)")
-    req = {"op": "submit", "queue": a.queue, "name": a.name,
+    if a.foreground:
+        if a.follow:
+            p.error("--foreground and --follow are mutually exclusive")
+        sys.exit(run_foreground(a, cmd))
+    req = {"op": "submit", "queue": a.queue, "description": a.description,
            "cmd": cmd, "cwd": os.getcwd(),
            "env": {k: v for k, v in os.environ.items()}}
     if a.time:
@@ -85,6 +94,102 @@ def cmd_submit(argv):
           % (r["id"], r["queue"], fmt_dur(r["time_sec"]), r["log"], r.get("warn", "")))
     if a.follow:
         sys.exit(follow_job(r["id"], r["log"]))   # exit with the job's own status
+
+
+def run_foreground(a, cmd):
+    """Foreground counterpart to a plain submit: reserve the GPU slot via the
+    lease protocol (a first-class slot record — shows this command's description
+    and real exit code in history, no placeholder process), but run CMD right
+    here as a child of this shell — real stdin/tty, this user, this cwd/env — and
+    tee its output to BOTH our stdout and the broker job log so it still shows up
+    in gpu-q / gpu-log. Release on exit and propagate the command's exit status.
+    """
+    import signal as _signal
+    import threading
+    import subprocess
+
+    description = a.description or os.path.basename(cmd[0])
+
+    def do_log(msg):
+        sys.stderr.write("gpu-submit: " + msg + "\n")
+        sys.stderr.flush()
+
+    status, jid, logpath = lease_acquire(a.queue, description, a.time, do_log=do_log)
+    if status != "granted":
+        detail = status.split(":", 1)[-1] if ":" in status else status
+        sys.exit("gpu-submit --foreground: did not get the GPU (%s)" % detail)
+    do_log("GPU granted (#%d); running on foreground" % jid)
+
+    # The daemon created the lease's log at grant time and chowned it to us, so
+    # we can append the real command's output into it (gpu-log still works).
+    try:
+        logf = open(logpath, "a", buffering=1)
+    except OSError:
+        logf = None
+
+    def finish(code):
+        if logf:
+            try:
+                logf.write("\n[command exited: %s]\n" % code)
+                logf.close()
+            except Exception:
+                pass
+        lease_release(jid, code)   # records the real exit in history + frees slot
+
+    try:
+        proc = subprocess.Popen(cmd, stdin=None,             # inherit our stdin (foreground)
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except OSError as e:
+        finish(127)
+        sys.exit("gpu-submit --foreground: cannot run %r: %s" % (cmd[0], e))
+
+    # Forward terminal signals to the child so Ctrl-C etc. behave as usual.
+    def _forward(signum, _frame):
+        try:
+            proc.send_signal(signum)
+        except Exception:
+            pass
+    for s in (_signal.SIGINT, _signal.SIGTERM, _signal.SIGHUP, _signal.SIGQUIT):
+        try:
+            _signal.signal(s, _forward)
+        except (OSError, ValueError):
+            pass
+
+    # If the broker revokes the slot under us (timeout/cancel/daemon restart),
+    # stop the command — we no longer hold the GPU.
+    revoked = {"hit": False}
+
+    def _watch():
+        while proc.poll() is None:
+            j = get_job(jid)
+            if not j or j["state"] != "running":
+                revoked["hit"] = True
+                do_log("GPU lease revoked (%s) -> stopping command"
+                       % (j["state"] if j else "gone"))
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                return
+            time.sleep(1.0)
+    threading.Thread(target=_watch, daemon=True).start()
+
+    out = sys.stdout.buffer
+    for chunk in iter(lambda: proc.stdout.read(4096), b""):
+        out.write(chunk)
+        out.flush()
+        if logf:
+            try:
+                logf.write(chunk.decode("utf-8", "replace"))
+            except Exception:
+                pass
+    code = proc.wait()
+    if code < 0:
+        code = 128 + (-code)                # killed by signal N -> 128+N
+    finish(code)
+    if revoked["hit"] and code == 0:
+        code = 125                          # command ended but we lost the lease
+    return code
 
 
 def fmt_clock(ts):
@@ -110,14 +215,14 @@ def cmd_q(argv):
         print("  #%-4d %-12s %-7s %-11s %s"
               % (run["id"], run["user"], run["queue"],
                  fmt_dur(run.get("elapsed", 0)) + "/" + fmt_dur(run["time_sec"]),
-                 run.get("name", "")))
+                 run.get("description", "")))
     else:
         print("  (GPU idle)")
     pend = r.get("pending", [])
     print("=== pending (%d) ===" % len(pend))
     for j in pend:
         print("  #%-4d %-12s %-7s limit=%-6s %s"
-              % (j["id"], j["user"], j["queue"], fmt_dur(j["time_sec"]), j.get("name", "")))
+              % (j["id"], j["user"], j["queue"], fmt_dur(j["time_sec"]), j.get("description", "")))
     if a.all:
         fin = r.get("finished", [])
         print("=== recent (%d) ===" % len(fin))
@@ -127,7 +232,7 @@ def cmd_q(argv):
             ec = j.get("exit_code")
             print("  #%-4d %-12s %-7s %-9s exit=%-4s %-7s ended %s  %s"
                   % (j["id"], j.get("user", ""), j.get("queue", ""), j.get("state", ""),
-                     "-" if ec is None else ec, dur, fmt_clock(st_e), j.get("name", "")))
+                     "-" if ec is None else ec, dur, fmt_clock(st_e), j.get("description", "")))
 
 
 def cmd_log(argv):
@@ -177,6 +282,48 @@ def exit_code_for(job):
     if ec is None:
         return 0
     return 128 + (-ec) if ec < 0 else ec     # killed by signal N -> 128+N (shell convention)
+
+
+def lease_acquire(queue, description, time_str, do_log=lambda _msg: None, should_abort=None):
+    """Reserve the GPU slot via the daemon `lease` op (a first-class slot record,
+    no placeholder process) and wait until the broker grants it. Returns
+    (status, jid, logpath):
+      'granted'         - the slot is ours
+      'aborted'         - should_abort() fired before grant (we released it)
+      'revoked:<state>' - broker finished the lease before granting
+      'error:<msg>'     - could not even queue it
+    Progress lines go to do_log() (defaults to a no-op)."""
+    req = {"op": "lease", "queue": queue, "description": description}
+    if time_str:
+        req["time"] = parse_time(time_str)
+    r = call(req)
+    if not r.get("ok"):
+        return ("error:" + r.get("error", "?"), None, None)
+    jid, logpath = r["id"], r["log"]
+    do_log("queued #%d on %s (limit %s); waiting for GPU..."
+           % (jid, r["queue"], fmt_dur(r["time_sec"])))
+    last = None
+    while True:
+        if should_abort and should_abort():
+            lease_release(jid)
+            return ("aborted", jid, logpath)
+        j = get_job(jid)
+        if j is None:
+            return ("revoked:gone", jid, logpath)
+        st = j["state"]
+        if st == "running":
+            return ("granted", jid, logpath)
+        if st in FINISHED:
+            return ("revoked:" + st, jid, logpath)
+        if st != last:
+            do_log("job #%d %s..." % (jid, st))
+            last = st
+        time.sleep(0.3)
+
+
+def lease_release(jid, exit_code=0):
+    """Release a held (or still-pending) lease, recording exit_code in history."""
+    return call({"op": "release", "id": jid, "exit_code": exit_code})
 
 
 def follow_job(jid, path):
@@ -238,14 +385,13 @@ def cmd_lease(argv):
     """Cooperative GPU lease helper (see PARASOL_ZK_GPU_LEASE_CMD in
     parasol-dex-zk-api). Line contract with the caller:
 
-      * we submit a placeholder "holder" job that occupies the broker's single
-        GPU slot; the real GPU work runs in the *caller's* process;
-      * when the broker grants us the slot (holder starts running) we print
-        exactly ``GRANTED`` on stdout;
+      * we reserve the broker's single GPU slot (a first-class lease record, no
+        placeholder process); the real GPU work runs in the *caller's* process;
+      * when the broker grants us the slot we print exactly ``GRANTED`` on stdout;
       * if the broker takes the slot back under us (timeout/cancel/crash) we
         print ``REVOKED <reason>`` on stdout;
-      * the caller releases by closing our stdin (EOF): we cancel the holder so
-        the slot frees immediately, then exit 0;
+      * the caller releases by closing our stdin (EOF): we release the slot so it
+        frees immediately, then exit 0;
       * queue-wait progress is logged to stderr, never stdout.
     """
     p = argparse.ArgumentParser(
@@ -256,14 +402,15 @@ def cmd_lease(argv):
     p.add_argument("--queue", "-q", default=None)
     p.add_argument("--time", "-t", default=None,
                    help="max hold, e.g. 1h (broker-capped); frees the slot if we die")
-    p.add_argument("--name", "-n", default="gpu-lease")
+    p.add_argument("--description", "-d", default="gpu-lease",
+                   help="what is using the GPU (shown in gpu-q)")
     a = p.parse_args(argv)
 
     def say(tag):                         # the stdout line contract
         sys.stdout.write(tag + "\n")
         sys.stdout.flush()
 
-    def note(msg):                        # progress -> stderr only
+    def do_log(msg):                        # progress -> stderr only
         sys.stderr.write("gpu-lease: " + msg + "\n")
         sys.stderr.flush()
 
@@ -293,59 +440,29 @@ def cmd_lease(argv):
             return stdin_eof()
         return False
 
-    # The holder just parks the GPU slot; the real GPU work runs in the caller's
-    # process. Use a numeric sleep (portable) sized to the lease window — we
-    # cancel it on release, and the broker's own --time cap reaps it anyway if
-    # the caller dies without releasing (so a crash can't hold the GPU forever).
-    hold_sec = parse_time(a.time) if a.time else 86400
-    req = {"op": "submit", "queue": a.queue, "name": a.name,
-           "cmd": ["sleep", str(hold_sec)], "cwd": "/", "env": {}}
-    if a.time:
-        req["time"] = hold_sec
-    r = call(req)
-    if not r.get("ok"):
-        note("submit failed: " + r.get("error", "?"))
-        say("REVOKED submit-failed")
+    status, jid, _ = lease_acquire(a.queue, a.description, a.time,
+                                   do_log=do_log, should_abort=stdin_eof)
+    if status == "aborted":
+        do_log("released #%d before grant" % jid)
+        sys.exit(0)
+    if status.startswith("error:"):
+        do_log("lease failed: " + status[len("error:"):])
+        say("REVOKED lease-failed")
         sys.exit(1)
-    jid = r["id"]
-    note("queued job #%d on %s (limit %s); waiting for GPU..."
-         % (jid, r["queue"], fmt_dur(r["time_sec"])))
-
-    def release_and_exit(code, before_grant=False):
-        # Cancel the holder so the next queued job starts at once.
-        call({"op": "cancel", "id": jid})
-        note("released #%d%s" % (jid, " before grant" if before_grant else ""))
-        sys.exit(code)
-
-    # Phase 1: wait for the broker to grant the slot (holder -> running). Bail if
-    # the caller gives up (stdin EOF) while we are still queued.
-    last = None
-    while True:
-        if stdin_eof():
-            release_and_exit(0, before_grant=True)
-        j = get_job(jid)
-        if j is None:
-            say("REVOKED job-vanished")
-            sys.exit(1)
-        st = j["state"]
-        if st == "running":
-            break
-        if st in FINISHED:                # cancelled/timed out/failed before grant
-            say("REVOKED " + st)
-            sys.exit(1)
-        if st != last:
-            note("job #%d %s..." % (jid, st))
-            last = st
-        time.sleep(0.3)
+    if status.startswith("revoked:"):
+        say("REVOKED " + status[len("revoked:"):])
+        sys.exit(1)
 
     say("GRANTED")
-    note("granted slot (job #%d); holding until stdin closes" % jid)
+    do_log("granted slot (#%d); holding until stdin closes" % jid)
 
-    # Phase 2: hold the slot until the caller releases (stdin EOF) or the broker
-    # revokes it under us (timeout/cancel/crash).
+    # Hold the slot until the caller releases (stdin EOF) or the broker revokes
+    # it under us (timeout/cancel/crash).
     while True:
         if wait_or_release(1.0):
-            release_and_exit(0)
+            lease_release(jid, 0)
+            do_log("released #%d" % jid)
+            sys.exit(0)
         j = get_job(jid)
         st = j["state"] if j else "gone"
         if st != "running":
